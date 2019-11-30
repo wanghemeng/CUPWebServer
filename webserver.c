@@ -11,6 +11,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <semaphore.h>
+#include <sys/stat.h>
+#include <signal.h>
 
 #define VERSION 23
 #define BUFSIZE 8096
@@ -22,12 +26,13 @@
 #define CHANGELINE 555
 #define BEGIN 111
 
+#define SEM_NAME "sem_example"
+#define SHM_NAME "mmap_example"
+
 #ifndef SIGCLD
 #   define SIGCLD SIGCHLD
 #endif
 
-struct timeval t1, t2;
-double timeslide;
 char timecal[BUFSIZE];
 
 struct {
@@ -102,6 +107,8 @@ void logger(int type, char *s1, char *s2, int socket_fd)
     /* this is a child web server process, so we can exit on errors */
 void web(int fd, int hit)
 {
+    struct timeval t1, t2;
+    double timeslide;
     logger(BEGIN,"","",fd);
     int j, file_fd, buflen;
     long i, ret, len;
@@ -188,16 +195,43 @@ void web(int fd, int hit)
     logger(TIMELOG,"header",timecal,0);
     logger(CHANGELINE,"","",0);
 
-    sleep(1);  /* allow socket to drain before signalling the socket is closed */
+    // sleep(1);  /* allow socket to drain before signalling the socket is closed */
+    usleep(10000);  /* allow socket to drain before signalling the socket is closed */
+    close(file_fd);
     close(fd);
     // exit(1);
 }
 
 int main(int argc, char **argv)
 {
+    struct timeval t1, t2;
+    double timeslide;
     gettimeofday(&t1, NULL);
-    int i, port, listenfd, socketfd, hit; // deleted pid
+    int i, port, listenfd, socketfd, hit;
     socklen_t length;
+    pid_t pid;
+
+    sem_t *psem;
+    if ((psem = sem_open(SEM_NAME, O_CREAT, 0666, 1)) == SEM_FAILED)
+    {
+        perror("create semaphore error");
+        exit(1);
+    }
+    int shm_fd;
+    if ((shm_fd = shm_open(SHM_NAME, O_RDWR|O_CREAT, 0666)) < 0)
+    {
+        perror("create shared memory object error");
+        exit(1);
+    }
+    ftruncate(shm_fd, sizeof(int));
+    void *memPtr = mmap(NULL, sizeof(int), PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (memPtr == MAP_FAILED)
+    {
+        perror("creat mmap error");
+        exit(1);
+    }
+    *(double *)memPtr = 0;
+
     static struct sockaddr_in cli_addr; /* static = initialised to zeros */
     static struct sockaddr_in serv_addr; /* static = initialised to zeros */
 
@@ -229,16 +263,16 @@ int main(int argc, char **argv)
         exit(4);
     }
     /* Become deamon + unstopable and no zombies children (= no wait()) */
-    // if(fork() != 0)
-    //   return 0; /* parent returns OK to shell */
-    // (void)signal(SIGCLD, SIG_IGN); /* ignore child death */
-    // (void)signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
-    // for(i=0;i<32;i++)
-    //   (void)close(i);    /* close open files */
-    // (void)setpgrp();    /* break away from process group */
-    // logger(LOG,"nweb starting",argv[1],getpid());
+    if(fork() != 0)
+        return 0; /* parent returns OK to shell */
+    (void)signal(SIGCLD, SIG_IGN); /* ignore child death */
+    (void)signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
+    for(i=0;i<32;i++)
+        (void)close(i);    /* close open files */
+    (void)setpgrp();    /* break away from process group */
+    logger(LOG,"nweb starting",argv[1],getpid());
     /* setup the network socket */
-    if((listenfd = socket(AF_INET, SOCK_STREAM,0)) <0)
+    if((listenfd = socket(AF_INET, SOCK_STREAM,0)) < 0)
         logger(ERROR, "system call","socket",0);
 
     port = atoi(argv[1]);
@@ -258,21 +292,36 @@ int main(int argc, char **argv)
     (void)sprintf(timecal,"%f",timeslide);
     logger(TIMELOG,"Preparation",timecal,0);
 
-    for(hit=1; ;hit++) {
+    for(hit=1;;hit++) {
         length = sizeof(cli_addr);
+        /* use select or poll to aviod block */
         if((socketfd = accept(listenfd, (struct sockaddr *)&cli_addr, &length)) < 0)
             logger(ERROR,"system call","accept",0);
-        web(socketfd,hit);// never returns
-        // if((pid = fork()) < 0) {
-        //   logger(ERROR,"system call","fork",0);
-        // }
-        // else {
-        //   if(pid == 0) {   /* child */
-        //     (void)close(listenfd);
-        //     web(socketfd,hit); /* never returns */
-        //   } else {   /* parent */
-        //     (void)close(socketfd);
-        //   }
-        // }
+        else
+        // web(socketfd,hit);// never returns
+            if((pid = fork()) < 0) {
+                logger(ERROR,"system call","fork",0);
+            }
+            else {
+                if(pid == 0) {   /* child */
+                    (void)close(listenfd);
+                    gettimeofday(&t1, NULL);
+                    web(socketfd,hit); /* never returns */
+                    gettimeofday(&t2, NULL);
+                    timeslide = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+                    *(double *)memPtr += timeslide;
+                    int fd ;
+                    if((fd = open("time.log", O_CREAT| O_WRONLY | O_APPEND,0644)) >= 0)
+                    {
+                        (void)sprintf(timecal,"Piece time is %f ms, whole time is %f ms\n",timeslide, *(double *)memPtr);
+                        (void)write(fd,timecal,strlen(timecal));
+                    }
+                    (void)close(fd);
+                    exit(0);
+                } else {   /* parent */
+                    (void)close(socketfd);
+                }
+            }
     }
+    // wait(NULL);
 }
